@@ -1,0 +1,252 @@
+name: Government Notice Telegram Monitor
+
+on:
+  schedule:
+    # Runs every 10 minutes in UTC.
+    # Note: GitHub Actions scheduled workflows can experience queue delays during high load
+    # and are not guaranteed to execute at exact 10-minute intervals.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "'auto' (baseline if uninitialized, else monitor), 'baseline' (record existing notices with 0 alerts), 'monitor' (alert on new notices), 'live_test' (send [LIVE TEST] per site + summary), 'rrcb_probe' (READ-ONLY check of the RRB endpoint: no Telegram, no secrets, no state change), 'ping' (does nothing; verifies a cron-job.org dispatch)"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - baseline
+          - monitor
+          - live_test
+          - rrcb_probe
+          - ping
+      relay_url_template:
+        description: "Only for mode=rrcb_probe: OPTIONAL https relay URL containing {url}. Leave empty to test direct access only."
+        required: false
+        default: ""
+
+# Minimum required repository permissions to read code and commit updated state.
+permissions:
+  contents: write
+
+# Prevent overlapping workflow runs from racing on state persistence.
+# Do not cancel an in-progress run when a new scheduled trigger fires. GitHub keeps at most ONE
+# pending run per concurrency group (a newer pending run replaces an older pending one), so a
+# GitHub `schedule` trigger plus a cron-job.org `workflow_dispatch` trigger can never run in parallel.
+# cron-job.org must dispatch WITHOUT inputs (defaults to mode=auto -> monitor); see README section 5.
+# Probe and ping runs never touch state, so they get their own group and cannot be displaced by (or block) monitor runs.
+concurrency:
+  group: govt-notice-telegram-alerts-${{ (inputs.mode == 'rrcb_probe' || inputs.mode == 'ping') && github.run_id || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  monitor-notices:
+    name: Scrape Notices & Send Telegram Alerts
+    if: ${{ inputs.mode != 'rrcb_probe' && inputs.mode != 'ping' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout repository and restore committed state
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Synchronize with latest remote branch state after acquiring concurrency lock
+        run: |
+          # Critical fix for overlapping schedule + cron-job.org workflow_dispatch runs:
+          # GitHub Actions pins GITHUB_SHA when a run is queued, BEFORE it acquires the
+          # concurrency lock. Resetting to origin/${GITHUB_REF_NAME} after checkout ensures
+          # this run always loads the freshest data/notice_state.json committed by any prior run.
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify committed state file exists before scraping
+        run: |
+          if [ ! -f "data/notice_state.json" ]; then
+            echo "::error::State file data/notice_state.json is missing from the repository."
+            exit 2
+          fi
+
+      - name: Run government notice monitor
+        id: monitor
+        env:
+          TZ: Asia/Kolkata
+          PYTHONUNBUFFERED: "1"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_MODE: ${{ inputs.mode || 'auto' }}
+          # Optional, opt-in HTTPS relay for the RRB/RRCB feed (see README). Empty = direct access only.
+          RRCB_RELAY_URL_TEMPLATE: ${{ secrets.RRCB_RELAY_URL_TEMPLATE }}
+        run: |
+          # Ensure state includes any remote commit that landed during dependency setup.
+          # A failed merge means the remote state is unreadable/corrupt: abort instead of monitoring
+          # (and possibly re-alerting) on a stale or inconsistent ledger.
+          git fetch origin "${GITHUB_REF_NAME}"
+          if git show "origin/${GITHUB_REF_NAME}:data/notice_state.json" > /tmp/pre_run_remote_state.json 2>/dev/null; then
+            if ! python main.py --merge-state /tmp/pre_run_remote_state.json --state-file data/notice_state.json; then
+              echo "monitor_exit_code=2" >> "$GITHUB_OUTPUT"
+              echo "::error::Could not merge the latest remote data/notice_state.json; aborting before any alerts are sent."
+              exit 2
+            fi
+            rm -f /tmp/pre_run_remote_state.json
+          fi
+
+          set +e
+          python main.py --mode "${RUN_MODE}" --state-file data/notice_state.json --allow-partial-source-failures
+          EXIT_CODE=$?
+          set -e
+          echo "monitor_exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          echo "Monitor exited with code: ${EXIT_CODE}"
+          # Fatal state corruption (2) or missing credentials (3) must abort before committing
+          if [ "${EXIT_CODE}" -eq 2 ] || [ "${EXIT_CODE}" -eq 3 ]; then
+            echo "::error::Aborting state persistence due to fatal exit code ${EXIT_CODE}."
+            exit "${EXIT_CODE}"
+          fi
+
+      # Runs even if the monitor step was cancelled or hit the job timeout AFTER sending Telegram alerts,
+      # because the state file is written atomically after each confirmed send; skipping this step would
+      # lose the sent-ledger and re-alert the same notices on the next run. Fatal exits 2/3 stay uncommitted.
+      - name: Persist and push state updates safely
+        id: persist
+        if: ${{ always() && steps.monitor.outcome != 'skipped' && steps.monitor.outputs.monitor_exit_code != '2' && steps.monitor.outputs.monitor_exit_code != '3' }}
+        env:
+          TZ: Asia/Kolkata
+          RUN_MODE: ${{ inputs.mode || 'auto' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- data/notice_state.json; then
+            echo "No meaningful changes in data/notice_state.json; skipping commit."
+            exit 0
+          fi
+
+          # Snapshot our newly updated local state before committing so a conflict
+          # can losslessly merge notice fingerprints and delivery statuses.
+          cp data/notice_state.json /tmp/local_notice_state.json
+
+          git add data/notice_state.json
+          git commit -m "chore(state): update notice state (${RUN_MODE}) [skip ci]"
+
+          merge_local_onto_origin() {
+            git reset --hard "origin/${GITHUB_REF_NAME}"
+            python main.py --merge-state /tmp/local_notice_state.json --state-file data/notice_state.json
+            if ! git diff --quiet -- data/notice_state.json; then
+              git add data/notice_state.json
+              git commit -m "chore(state): merge notice state (${RUN_MODE}) [skip ci]"
+            fi
+            cp data/notice_state.json /tmp/local_notice_state.json
+          }
+
+          # Safe push with bounded lossless state merge on conflict (never force-push or discard state)
+          MAX_PUSH_ATTEMPTS=3
+          PUSH_SUCCESS=0
+          for ATTEMPT in $(seq 1 ${MAX_PUSH_ATTEMPTS}); do
+            echo "Pushing updated state to origin (attempt ${ATTEMPT}/${MAX_PUSH_ATTEMPTS})..."
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              PUSH_SUCCESS=1
+              break
+            fi
+            echo "::warning::git push failed on attempt ${ATTEMPT}; fetching origin/${GITHUB_REF_NAME} and merging state losslessly..."
+            git fetch origin "${GITHUB_REF_NAME}"
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              git rebase --abort || true
+              merge_local_onto_origin
+            elif ! python -c "import main; main.load_state('data/notice_state.json', allow_init_if_missing=False)"; then
+              # A textual 3-way merge of one JSON file can succeed yet produce an invalid ledger.
+              echo "::warning::State file failed validation after a clean rebase; rebuilding it with the lossless state merge."
+              merge_local_onto_origin
+            fi
+            sleep $((ATTEMPT * 2))
+          done
+
+          rm -f /tmp/local_notice_state.json
+          if [ "${PUSH_SUCCESS}" -ne 1 ]; then
+            echo "::error::Failed to persist data/notice_state.json after ${MAX_PUSH_ATTEMPTS} attempts."
+            exit 1
+          fi
+          echo "Successfully committed and pushed data/notice_state.json."
+
+      - name: Evaluate final workflow status
+        if: ${{ always() && steps.monitor.outcome != 'skipped' }}
+        env:
+          MONITOR_EXIT_CODE: ${{ steps.monitor.outputs.monitor_exit_code }}
+        run: |
+          if [ -z "${MONITOR_EXIT_CODE}" ]; then
+            echo "::error::The monitor step did not complete (cancelled, timed out, or aborted before recording an exit code). Any state already written was persisted by the previous step."
+            exit 1
+          fi
+          if [ "${MONITOR_EXIT_CODE}" -ne 0 ]; then
+            echo "::error::Monitoring run completed with non-zero status (${MONITOR_EXIT_CODE}). State changes (if any) were persisted. Inspect the run summary for failed websites or delivery errors."
+            exit "${MONITOR_EXIT_CODE}"
+          fi
+          echo "Monitor exited 0. This means at least one website was fetched and parsed and state was saved; it does NOT mean every website was reachable. Failed websites and sources without publication dates are listed as annotations and in the job summary."
+
+  # ---------------------------------------------------------------------------------------------------------
+  # mode=rrcb_probe: READ-ONLY diagnosis of https://rrb.indianrailways.gov.in/getdata?loc=RRCB from a real GitHub
+  # runner. No secrets, no Telegram, no commits, never reads or writes data/notice_state.json's contents for
+  # monitoring. Raw responses are uploaded as the "rrcb-probe-output" artifact.
+  # ---------------------------------------------------------------------------------------------------------
+  rrcb-probe:
+    name: RRCB endpoint probe (read-only)
+    if: ${{ inputs.mode == 'rrcb_probe' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Probe (DNS, TCP/TLS, HTTP variants, project adapter)
+        env:
+          PROBE_RELAY_URL_TEMPLATE: ${{ inputs.relay_url_template }}
+          PYTHONUNBUFFERED: "1"
+        run: python scripts/probe_rrcb.py | tee probe_report.txt
+      - name: Read-only live check of the rrb_rrcb source (JSON)
+        run: |
+          mkdir -p probe_out
+          python main.py --live-check-json --sources rrb_rrcb | tee probe_out/live_check.json || true
+      - name: Upload raw responses and reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rrcb-probe-output
+          path: |
+            probe_report.txt
+            probe_out/
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------------------------------------
+  # mode=ping: does nothing except prove that a dispatch (e.g. from cron-job.org, with body
+  # {"ref":"main","inputs":{"mode":"ping"}}) was accepted and executed. No secrets, no checkout, no write access.
+  # ---------------------------------------------------------------------------------------------------------
+  ping:
+    name: Confirm dispatch was received
+    if: ${{ inputs.mode == 'ping' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Report what was received
+        run: |
+          echo "Dispatch accepted and executed."
+          echo "event=${{ github.event_name }} ref=${{ github.ref_name }} run_id=${{ github.run_id }}"

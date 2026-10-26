@@ -1,0 +1,2 @@
+# Optional HTML parser; main.py falls back to the standard library (html.parser) if it is missing.
+beautifulsoup4>=4.12.3,<5.0.0

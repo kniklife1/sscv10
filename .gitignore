@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment secrets (never commit credentials)
+.env
+.env.*
+
+# Temporary atomic state write files
+data/.notice_state_*.tmp
+*.tmp
+
+# Test & coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# State lock + probe output
+*.lock
+probe_out/
+probe_report.txt
